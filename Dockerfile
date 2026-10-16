@@ -12,6 +12,35 @@ RUN pip install --no-cache-dir fastapi uvicorn requests
 # ----------------------------------------------------------------
 RUN sed -i 's#/app/chromedriver#/data/chromedriver#g' /app/utils.py
 
+# ----------------------------------------------------------------
+# Pre-patch chromedriver AT BUILD TIME with the exact same patch
+# undetected_chromedriver applies (cdc block -> marker). At runtime the
+# rootfs is read-only, so the patched binary must be ready beforehand.
+# Verified byte-identical with undetected_chromedriver.patch_exe().
+# ----------------------------------------------------------------
+RUN cat > /app/patch_chromedriver.py <<'PYEOF'
+import re
+
+path = "/app/chromedriver"
+
+with open(path, "rb") as f:
+    content = f.read()
+
+match = re.search(rb"\{window\.cdc.*?;\}", content)
+
+if not match:
+    print("WARN: cdc block not found - runtime fallback will handle it")
+else:
+    old = match.group(0)
+    new = b'{console.log("undetected chromedriver 1337!")}'.ljust(len(old), b" ")
+    content = content.replace(old, new)
+    with open(path, "wb") as f:
+        f.write(content)
+    assert b"undetected chromedriver" in open(path, "rb").read(), "patch marker not written"
+    print("chromedriver pre-patched OK ->", path)
+PYEOF
+RUN /usr/local/bin/python /app/patch_chromedriver.py
+
 
 # ============================================================
 # ELMINYAWE API
@@ -38,6 +67,65 @@ import re
 import requests
 import json
 
+# ============================================================
+# CLEAN JSON OUTPUT
+# - never emits \uXXXX escapes (real UTF-8 characters instead)
+# - decodes leftover escape sequences INSIDE values
+#   (e.g. \u003C -> '<' , \u0026 -> '&' , \/ -> '/')
+# - keeps control-char escapes like \u000A intact (safe for JS
+#   code embedded in the returned HTML)
+# ============================================================
+
+_PAIR_RE = re.compile(r"\\u([dD][89aAbB][0-9a-fA-F]{2})\\u([dD][c-fC-F][0-9a-fA-F]{2})")
+_UNI_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def clean_text(value):
+    if not isinstance(value, str) or "\\" not in value:
+        return value
+
+    def _pair(m):
+        hi = int(m.group(1), 16)
+        lo = int(m.group(2), 16)
+        return chr(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00))
+
+    def _uni(m):
+        code = int(m.group(1), 16)
+        if code < 0x20 or code == 0x7F:
+            return m.group(0)
+        if 0xD800 <= code <= 0xDFFF:
+            return m.group(0)
+        return chr(code)
+
+    out = _PAIR_RE.sub(_pair, value)
+    out = _UNI_RE.sub(_uni, out)
+    out = out.replace("\\/", "/")
+    return out
+
+
+def clean_structure(obj):
+    if isinstance(obj, str):
+        return clean_text(obj)
+    if isinstance(obj, dict):
+        return {
+            clean_text(k) if isinstance(k, str) else k: clean_structure(v)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [clean_structure(v) for v in obj]
+    return obj
+
+
+class CleanJSONResponse(JSONResponse):
+    def render(self, content):
+        return json.dumps(
+            clean_structure(content),
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=None,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
 SOLVER_URL = os.environ.get("SOLVER_URL") or "http://127.0.0.1:8080"
 SOLVE_TIMEOUT = 180
 
@@ -45,6 +133,7 @@ SERVICE = "ELMINYAWE"
 DEVELOPER = "ELMINYAWE"
 
 app = FastAPI(
+    default_response_class=CleanJSONResponse,
     title="ELMINYAWE",
     description="ELMINYAWE API - Smart Solver Gateway",
     version="2.0.0"
@@ -284,7 +373,7 @@ def call_solver(body, session_value=None):
         try:
             data = response.json()
         except Exception:
-            return JSONResponse(
+            return CleanJSONResponse(
                 status_code=response.status_code,
                 content={
                     "service": SERVICE,
@@ -300,14 +389,14 @@ def call_solver(body, session_value=None):
         else:
             content = data
 
-        return JSONResponse(
+        return CleanJSONResponse(
             status_code=response.status_code,
             content=content
         )
 
     except requests.exceptions.Timeout:
 
-        return JSONResponse(
+        return CleanJSONResponse(
             status_code=504,
             content={
                 "status": "error",
@@ -319,7 +408,7 @@ def call_solver(body, session_value=None):
 
     except requests.exceptions.RequestException as e:
 
-        return JSONResponse(
+        return CleanJSONResponse(
             status_code=502,
             content={
                 "status": "error",
@@ -332,7 +421,7 @@ def call_solver(body, session_value=None):
 
     except Exception as e:
 
-        return JSONResponse(
+        return CleanJSONResponse(
             status_code=500,
             content={
                 "service": SERVICE,
@@ -391,7 +480,7 @@ def health():
 
     except Exception as e:
 
-        return JSONResponse(
+        return CleanJSONResponse(
             status_code=502,
             content={
                 "status": "offline",
@@ -415,7 +504,7 @@ def solve_get(
 
     if not url or not url.strip():
 
-        return JSONResponse(
+        return CleanJSONResponse(
             status_code=400,
             content={
                 "status": "error",
@@ -429,7 +518,7 @@ def solve_get(
 
     if not (url.startswith("http://") or url.startswith("https://")):
 
-        return JSONResponse(
+        return CleanJSONResponse(
             status_code=400,
             content={
                 "status": "error",
@@ -467,7 +556,7 @@ async def solve_v1(request: Request):
         try:
             body = json.loads(raw_body.decode("utf-8"))
         except Exception as e:
-            return JSONResponse(
+            return CleanJSONResponse(
                 status_code=400,
                 content={
                     "status": "error",
@@ -479,7 +568,7 @@ async def solve_v1(request: Request):
             )
 
         if not isinstance(body, dict):
-            return JSONResponse(
+            return CleanJSONResponse(
                 status_code=400,
                 content={
                     "status": "error",
@@ -496,7 +585,7 @@ async def solve_v1(request: Request):
 
     except Exception as e:
 
-        return JSONResponse(
+        return CleanJSONResponse(
             status_code=500,
             content={
                 "service": SERVICE,
@@ -522,7 +611,7 @@ async def solve_v1(request: Request):
 )
 async def catch_all(request: Request, path: str):
 
-    return JSONResponse(
+    return CleanJSONResponse(
         status_code=404,
         content={
             "service": SERVICE,
@@ -555,6 +644,8 @@ echo ""
 # its profile + crashpad under $HOME -> redirect everything to /data.
 # ============================================================
 
+mkdir -p /data 2>/dev/null
+
 if touch /data/.elminyawe_write_test 2>/dev/null; then
 
     rm -f /data/.elminyawe_write_test
@@ -564,20 +655,59 @@ if touch /data/.elminyawe_write_test 2>/dev/null; then
     export XDG_CACHE_HOME=/data/.cache
     export XDG_DATA_HOME=/data/.local/share
     export TMPDIR=/data/tmp
+    export PYTHONDONTWRITEBYTECODE=1
 
     mkdir -p /data/.config/chromium/"Crash Reports"/pending \
              /data/.cache \
              /data/.local/share/undetected_chromedriver \
              /data/tmp
 
-    # writable copy of chromedriver (undetected_chromedriver patches
-    # the binary in place on first run -> must NOT be on read-only /app)
-    if [ ! -x /data/chromedriver ]; then
-        cp /app/chromedriver /data/chromedriver 2>/dev/null
-        chmod +x /data/chromedriver 2>/dev/null
-    fi
-
     echo "[ELMINYAWE] Runtime dirs redirected to /data (read-only rootfs detected)"
+
+fi
+
+# ============================================================
+# CHROMEDRIVER (must be executable AND patchable)
+# /data may be mounted 'noexec' -> NEVER execute from /data directly.
+# utils.py is patched to use /data/chromedriver, so point that path
+# (via symlink) to a place where exec actually works.
+# ============================================================
+
+rm -f /data/chromedriver 2>/dev/null
+
+if grep -qa "undetected chromedriver" /app/chromedriver 2>/dev/null; then
+
+    # pre-patched at build time -> run it straight from the image
+    ln -sf /app/chromedriver /data/chromedriver
+    echo "[ELMINYAWE] chromedriver: using pre-patched driver from image"
+
+else
+
+    CD_DIR=""
+
+    for d in /tmp /dev/shm /data; do
+
+        printf '#!/bin/sh\necho OK\n' > "$d/.exec_test" 2>/dev/null || continue
+        chmod +x "$d/.exec_test" 2>/dev/null || continue
+
+        if "$d/.exec_test" >/dev/null 2>&1; then
+            CD_DIR="$d"
+            rm -f "$d/.exec_test"
+            break
+        fi
+
+        rm -f "$d/.exec_test"
+
+    done
+
+    if [ -n "$CD_DIR" ]; then
+        cp /app/chromedriver "$CD_DIR/chromedriver"
+        chmod +x "$CD_DIR/chromedriver"
+        ln -sf "$CD_DIR/chromedriver" /data/chromedriver
+        echo "[ELMINYAWE] chromedriver: runtime copy -> $CD_DIR/chromedriver"
+    else
+        echo "[ELMINYAWE] WARNING: no exec-capable writable dir found!"
+    fi
 
 fi
 
